@@ -10,7 +10,7 @@ import urllib
 
 #Variables to set for your project (or using commandline)
 projectId = 0
-versionId = 0
+versionId = None
 flurry_email = ''
 flurry_password = ''
 outFilename = 'events.json'
@@ -46,8 +46,8 @@ def sessionid_from_timestamp(timestamp):
     sessionIDs[s] = count
     return res
 
-def store_session(session):
-    sessionf.write(json.dumps(session) + '\n')
+def store_session(s):
+    sessionf.write(json.dumps(s) + '\n')
 
 def close_session():
     if sessionf:
@@ -56,18 +56,17 @@ def close_session():
 def get_events(session,projectId, date, offset):
     url = 'https://dev.flurry.com/eventsLogCsv.do'
 
-    params = {'projectID': projectId,
-              'versionCut': versionId,
-              'intervalCut': ('customInterval%04d_%02d_%02d-%04d_%02d_%02d') % ( date.year, date.month, date.day, date.year, date.month, date.day),
-              'stream' : 'true',
-              'direction' : 1,
-              'offset' : offset,
-              'limits' : 100}
+    params = (('projectID', projectId),
+              ('versionCut', versionId if versionId != None else 'versionsAll'),
+              ('intervalCut', ('customInterval%04d_%02d_%02d-%04d_%02d_%02d') % ( date.year, date.month, date.day, date.year, date.month, date.day) if date != None else 'allTime'),
+              ('stream', 'true'),
+              ('direction', 1),
+              ('offset', offset))
 
     resp = None
     while resp is None:
         print 'Fetching', url, urllib.urlencode(params)
-        resp = session.get(url,params = params, allow_redirects=False)
+        resp = session.get(url, params = params, allow_redirects=False)
         if resp.status_code == 302:
             location = resp.headers['location']
             if location == 'https://dev.flurry.com/secure/login.do':
@@ -86,6 +85,10 @@ def process_events(content):
     rows = [row for row in lines[1:] if len(row) > 0]
     print 'Number of Entries:', len(rows)
 
+    if len(rows) < 10:
+        print rows
+        return []
+
     # overrides with limited headers
     iEvent = header.index('Event')
     iParams = header.index('Params')
@@ -93,10 +96,18 @@ def process_events(content):
     iTimestamp = header.index('Timestamp')
     iUserID = header.index('User ID')
     iDevice = header.index('Device')
+    iVersion = header.index('Version')
+    print 'Header', header
 
     res = []
     sessionID = "Unset"
+    count = 0
+    max_limit_reached = False
     for row in rows:
+        if len(row) < iParams:
+            print 'Error row', row
+            max_limit_reached = True
+            continue
         r = {
             'SIDX' : row[iSessionIndex].strip(),
             'E' : row[iEvent].strip(),
@@ -108,15 +119,18 @@ def process_events(content):
                 'SID': sessionid_from_timestamp(row[iTimestamp].strip()),
                 'Timestamp': row[iTimestamp].strip(),
                 'Device': row[iDevice].strip(),
+                'V' : row[iVersion].strip()
             }
             sessionID = s['SID']
             store_session(s)
-            #print s
+            if count < 5:
+                count += 1
+                print 'Session', s
         r['SID'] = sessionID
         #print r
         res.append(r)
 
-    return res
+    return res, max_limit_reached
 
 
 def dump(projectId,email,password,startDate,endDate,offset):
@@ -124,14 +138,14 @@ def dump(projectId,email,password,startDate,endDate,offset):
     cur_date = startDate
 
     with open(outFilename,'a', 50 * 1024) as file:
-        while cur_date <= endDate:
-            events = get_events(session, projectId, cur_date, offset)
+        while cur_date == None or cur_date <= endDate:
+            events, max_limit_reached = get_events(session, projectId, cur_date, offset)
             events_count = len(events)
 
             for event in events:
                 file.write(json.dumps(event) + '\n')
 
-            if events_count > 0:
+            if events_count > 0 and max_limit_reached:
                 sessions_count = len([event for event in events if event['SIDX'] == '1'])
                 print {'date' : cur_date, 'events' : events_count, 'sessions' : sessions_count, 'offset' : offset}
                 offset += sessions_count
@@ -139,6 +153,7 @@ def dump(projectId,email,password,startDate,endDate,offset):
                 print {'date' : cur_date, 'events' : events_count, 'offset' : offset}
                 offset = 0
                 cur_date += datetime.timedelta(days=1)
+
             if test_mode:
                 file.flush()
                 file.close()
@@ -150,8 +165,8 @@ if __name__ == '__main__':
 
     # default variables
     offset = 0
-    startDate = datetime.datetime(2013,11,22)
-    endDate = datetime.datetime.today()
+    startDate = None
+    endDate = datetime.datetime.today().date()
 
     # options
     optlist, args = getopt.getopt(sys.argv[1:], '', 
